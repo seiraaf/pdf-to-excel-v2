@@ -2,7 +2,6 @@ from io import BytesIO
 from datetime import datetime
 import re
 import textwrap
-from urllib.parse import quote
 
 import pandas as pd
 import pdfplumber
@@ -124,12 +123,11 @@ def compact_lookup(value):
 
 @st.cache_data(show_spinner=False)
 def prepare_supplier_database(file_bytes=None, path=None):
-    """Read item→vendor database and optionally a WhatsApp number column.
+    """Read item-to-vendor supplier database.
 
     Required columns: NAMA, VENDOR
-    Optional WA aliases: NO WA, NO_WA, WA, WHATSAPP, PHONE, TELEPON
     """
-    base_columns = ["NAMA", "VENDOR", "NO WA", "LOOKUP", "LOOKUP_COMPACT"]
+    base_columns = ["NAMA", "VENDOR", "LOOKUP", "LOOKUP_COMPACT"]
     try:
         if file_bytes:
             df = pd.read_excel(BytesIO(file_bytes))
@@ -142,24 +140,13 @@ def prepare_supplier_database(file_bytes=None, path=None):
     if "NAMA" not in df.columns or "VENDOR" not in df.columns:
         return pd.DataFrame(columns=base_columns)
 
-    phone_aliases = ["NO WA", "NO_WA", "WA", "WHATSAPP", "PHONE", "TELEPON", "NO TELP"]
-    phone_column = next((column for column in phone_aliases if column in df.columns), None)
-    keep_columns = ["NAMA", "VENDOR"] + ([phone_column] if phone_column else [])
-    df = df[keep_columns].copy()
-    if phone_column and phone_column != "NO WA":
-        df = df.rename(columns={phone_column: "NO WA"})
-    if "NO WA" not in df.columns:
-        df["NO WA"] = ""
-
-    df = df.dropna(subset=["NAMA", "VENDOR"])
+    df = df[["NAMA", "VENDOR"]].dropna(subset=["NAMA", "VENDOR"]).copy()
     df["NAMA"] = df["NAMA"].map(lambda value: clean_text(value, ""))
     df["VENDOR"] = df["VENDOR"].map(lambda value: clean_text(value, ""))
-    df["NO WA"] = df["NO WA"].map(lambda value: clean_text(value, ""))
     df["LOOKUP"] = df["NAMA"].map(normalize_lookup)
     df["LOOKUP_COMPACT"] = df["NAMA"].map(compact_lookup)
     df = df[df["LOOKUP"] != ""]
     return df
-
 
 def lookup_supplier(item, supplier_db):
     item_lookup = normalize_lookup(item)
@@ -189,169 +176,6 @@ def lookup_supplier(item, supplier_db):
     if candidates:
         return sorted(candidates, reverse=True)[0][1]
     return ""
-
-
-def normalize_whatsapp_number(value):
-    """Normalize Indonesian/mobile phone values for wa.me links."""
-    raw = clean_text(value, "")
-    if not raw:
-        return ""
-
-    # Excel may read numeric phone cells as 62812....0
-    raw = re.sub(r"\.0$", "", raw)
-    digits = re.sub(r"\D", "", raw)
-    if not digits:
-        return ""
-    if digits.startswith("00"):
-        digits = digits[2:]
-    if digits.startswith("0"):
-        digits = "62" + digits[1:]
-    elif digits.startswith("8"):
-        digits = "62" + digits
-    return digits
-
-
-def lookup_supplier_phone(supplier, supplier_db):
-    if supplier_db.empty or not supplier or "NO WA" not in supplier_db.columns:
-        return ""
-    target = normalize_lookup(supplier)
-    matches = supplier_db[supplier_db["VENDOR"].map(normalize_lookup) == target]
-    if matches.empty:
-        return ""
-    for value in matches["NO WA"].tolist():
-        phone = normalize_whatsapp_number(value)
-        if phone:
-            return phone
-    return ""
-
-
-def build_whatsapp_message(unit, supplier, group_df):
-    po_date = next((clean_text(v, "") for v in group_df.get("PO Date", []) if clean_text(v, "")), "")
-    no_po_values = [clean_text(v, "") for v in group_df.get("No PO", []) if clean_text(v, "")]
-    no_po = no_po_values[0] if no_po_values else ""
-
-    lines = [f"Halo {supplier},", "", "Mohon diproses pesanan berikut:", f"Unit: {UNIT_TITLES.get(unit, unit.upper())}"]
-    if po_date:
-        lines.append(po_date)
-    if no_po:
-        lines.append(f"No PO: {no_po}")
-    lines.append("")
-
-    for idx, row in enumerate(group_df.to_dict("records"), 1):
-        item = clean_text(row.get("Item", ""), "")
-        qty = clean_text(row.get("Qty", ""), "")
-        unit_item = clean_text(row.get("Unit Item", ""), "")
-        lines.append(f"{idx}. {item} — {qty} {unit_item}")
-
-    lines.extend(["", "Detail terlampir pada gambar PO. Terima kasih."])
-    return "\n".join(lines)
-
-
-def _load_font(size, bold=False):
-    candidates = (
-        ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"]
-        if bold
-        else ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"]
-    )
-    for path in candidates:
-        try:
-            return ImageFont.truetype(path, size=size)
-        except OSError:
-            pass
-    return ImageFont.load_default()
-
-
-def _wrap_cell(text, max_chars):
-    text = clean_text(text, "")
-    if not text:
-        return [""]
-    return textwrap.wrap(text, width=max_chars, break_long_words=False, break_on_hyphens=False) or [text]
-
-
-def build_supplier_po_image(unit, supplier, group_df):
-    """Create a shareable PNG resembling the purchasing sheet shown by the user."""
-    group_df = group_df.reset_index(drop=True)
-    po_date = next((clean_text(v, "") for v in group_df.get("PO Date", []) if clean_text(v, "")), "PO")
-
-    width = 1500
-    margin = 24
-    title_h = 66
-    date_h = 48
-    header_h = 58
-    padding_y = 14
-    line_h = 30
-
-    # Supplier, No PO, Inv Name, Q, Unit — matches the working Excel layout.
-    col_widths = [260, 250, 650, 160, 130]
-    headers = ["Supplier", "No PO", "Inv Name", "Q", "Unit"]
-    char_limits = [22, 20, 48, 12, 10]
-
-    rows = []
-    row_heights = []
-    for row in group_df.to_dict("records"):
-        values = [
-            supplier,
-            clean_text(row.get("No PO", ""), ""),
-            clean_text(row.get("Item", ""), ""),
-            clean_text(row.get("Qty", ""), ""),
-            clean_text(row.get("Unit Item", ""), ""),
-        ]
-        wrapped = [_wrap_cell(v, lim) for v, lim in zip(values, char_limits)]
-        lines = max(len(part) for part in wrapped)
-        rows.append(wrapped)
-        row_heights.append(max(56, lines * line_h + padding_y * 2))
-
-    height = margin * 2 + title_h + date_h + 18 + header_h + sum(row_heights)
-    img = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(img)
-    title_font = _load_font(38, bold=True)
-    date_font = _load_font(25, bold=True)
-    header_font = _load_font(23, bold=True)
-    body_font = _load_font(22, bold=False)
-
-    # Title + PO date
-    y = margin
-    draw.text((margin, y + 4), UNIT_TITLES.get(unit, unit.upper()), font=title_font, fill="black")
-    y += title_h
-    draw.text((margin, y + 4), po_date or "PO", font=date_font, fill="black")
-    y += date_h + 18
-
-    table_x = margin
-    table_w = sum(col_widths)
-    # Header background
-    draw.rectangle((table_x, y, table_x + table_w, y + header_h), fill="#F2F2F2", outline="black", width=2)
-    x = table_x
-    for header, cw in zip(headers, col_widths):
-        draw.rectangle((x, y, x + cw, y + header_h), outline="black", width=2)
-        bbox = draw.textbbox((0, 0), header, font=header_font)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
-        draw.text((x + (cw - tw) / 2, y + (header_h - th) / 2 - 3), header, font=header_font, fill="black")
-        x += cw
-    y += header_h
-
-    for wrapped, rh in zip(rows, row_heights):
-        x = table_x
-        for col_idx, (parts, cw) in enumerate(zip(wrapped, col_widths)):
-            draw.rectangle((x, y, x + cw, y + rh), outline="black", width=2)
-            total_text_h = len(parts) * line_h
-            ty = y + max(padding_y, (rh - total_text_h) / 2)
-            for part in parts:
-                bbox = draw.textbbox((0, 0), part, font=body_font)
-                tw = bbox[2] - bbox[0]
-                if col_idx in (3, 4):
-                    tx = x + (cw - tw) / 2
-                else:
-                    tx = x + 10
-                draw.text((tx, ty), part, font=body_font, fill="black")
-                ty += line_h
-            x += cw
-        y += rh
-
-    output = BytesIO()
-    img.save(output, format="PNG", optimize=True)
-    output.seek(0)
-    return output
 
 
 def looks_like_number(value):
@@ -718,7 +542,7 @@ with st.sidebar:
         "Upload DATABASE SUP.xlsx",
         type=["xlsx"],
         key="supplier_db",
-        help="Wajib: NAMA dan VENDOR. Opsional: NO WA untuk tombol WhatsApp langsung.",
+        help="Database minimal memiliki kolom NAMA dan VENDOR.",
     )
     if supplier_file:
         supplier_db = prepare_supplier_database(supplier_file.getvalue())
@@ -729,11 +553,6 @@ with st.sidebar:
         st.warning("Database supplier belum terbaca. Supplier tetap bisa diproses, tetapi kolom supplier dapat kosong.")
     else:
         st.success(f"{len(supplier_db):,} item supplier terbaca.")
-        if "NO WA" in supplier_db.columns and supplier_db["NO WA"].astype(str).str.strip().ne("").any():
-            phone_count = supplier_db.loc[supplier_db["NO WA"].astype(str).str.strip().ne(""), "VENDOR"].nunique()
-            st.caption(f"📱 Nomor WhatsApp tersedia untuk {phone_count} supplier.")
-        else:
-            st.caption("Tambahkan kolom **NO WA** agar tombol chat supplier aktif.")
 
     st.divider()
     st.subheader("📊 Status Data")
@@ -899,60 +718,39 @@ if st.session_state.all_data:
             )
 
     st.divider()
-    st.subheader("3. Kirim PO ke Supplier via WhatsApp")
-    st.caption("Data otomatis dikelompokkan per **unit + supplier**. Download gambar PO lalu buka chat supplier yang tepat.")
+    st.subheader("3. Screenshot PO per Supplier")
+    st.caption("Data otomatis dikelompokkan per **unit + supplier**. Preview lalu download gambar PO yang ingin dikirim.")
 
-    wa_ready_df = pd.DataFrame(st.session_state.all_data)
-    wa_ready_df["Supplier"] = wa_ready_df["Supplier"].fillna("").astype(str).str.strip()
-    wa_ready_df = wa_ready_df[wa_ready_df["Supplier"] != ""]
+    supplier_po_df = pd.DataFrame(st.session_state.all_data)
+    supplier_po_df["Supplier"] = supplier_po_df["Supplier"].fillna("").astype(str).str.strip()
+    supplier_po_df = supplier_po_df[supplier_po_df["Supplier"] != ""]
 
-    if wa_ready_df.empty:
+    if supplier_po_df.empty:
         st.info("Belum ada supplier yang terdeteksi. Upload database supplier atau isi supplier di menu Review & Edit.")
     else:
-        group_keys = ["Unit", "Supplier"]
-        grouped = list(wa_ready_df.groupby(group_keys, sort=False))
-        st.write(f"**{len(grouped)} supplier/unit siap dibuatkan PO WhatsApp.**")
+        grouped = list(supplier_po_df.groupby(["Unit", "Supplier"], sort=False))
+        st.write(f"**{len(grouped)} supplier/unit siap dibuatkan screenshot PO.**")
 
-        for (wa_unit, wa_supplier), wa_group in grouped:
-            phone = lookup_supplier_phone(wa_supplier, supplier_db)
-            po_image = build_supplier_po_image(wa_unit, wa_supplier, wa_group)
-            safe_supplier = re.sub(r"[^A-Za-z0-9_-]+", "_", wa_supplier).strip("_") or "supplier"
-            safe_unit = re.sub(r"[^A-Za-z0-9_-]+", "_", wa_unit).strip("_") or "unit"
+        for (po_unit, po_supplier), po_group in grouped:
+            po_image = build_supplier_po_image(po_unit, po_supplier, po_group)
+            safe_supplier = re.sub(r"[^A-Za-z0-9_-]+", "_", po_supplier).strip("_") or "supplier"
+            safe_unit = re.sub(r"[^A-Za-z0-9_-]+", "_", po_unit).strip("_") or "unit"
             file_name = f"PO_{safe_unit}_{safe_supplier}.png"
 
-            with st.expander(f"💬 {wa_supplier} · {wa_unit} · {len(wa_group)} item"):
-                st.image(po_image.getvalue(), caption=f"Preview PO untuk {wa_supplier}", use_container_width=True)
-                dcol, wcol = st.columns(2)
-                with dcol:
-                    st.download_button(
-                        "🖼️ Download Gambar PO",
-                        data=po_image.getvalue(),
-                        file_name=file_name,
-                        mime="image/png",
-                        use_container_width=True,
-                        key=f"download_wa_{safe_unit}_{safe_supplier}",
-                    )
-                with wcol:
-                    if phone:
-                        message = build_whatsapp_message(wa_unit, wa_supplier, wa_group)
-                        wa_url = f"https://wa.me/{phone}?text={quote(message)}"
-                        st.link_button(
-                            "💚 Buka Chat WhatsApp",
-                            wa_url,
-                            use_container_width=True,
-                        )
-                    else:
-                        st.button(
-                            "💚 Nomor WA belum ada",
-                            disabled=True,
-                            use_container_width=True,
-                            key=f"missing_wa_{safe_unit}_{safe_supplier}",
-                        )
-                        st.caption("Isi kolom **NO WA** pada DATABASE SUP.xlsx untuk supplier ini.")
-
-                if phone:
-                    st.caption(f"Nomor tujuan: +{phone}")
-                st.info("WhatsApp akan membuka chat dan mengisi pesan otomatis. Gambar PO tetap perlu kamu attach dari hasil download karena wa.me tidak bisa menempelkan file otomatis.")
+            with st.expander(f"📷 {po_supplier} · {po_unit} · {len(po_group)} item"):
+                st.image(
+                    po_image.getvalue(),
+                    caption=f"Preview PO untuk {po_supplier}",
+                    use_container_width=True,
+                )
+                st.download_button(
+                    "⬇️ Download Screenshot PO",
+                    data=po_image.getvalue(),
+                    file_name=file_name,
+                    mime="image/png",
+                    use_container_width=True,
+                    key=f"download_po_{safe_unit}_{safe_supplier}",
+                )
 
     st.divider()
     st.subheader("4. Convert & Download Excel")
